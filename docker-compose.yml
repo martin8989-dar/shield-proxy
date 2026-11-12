@@ -1,0 +1,39 @@
+services:
+  # Contenedor 1: Nodo Escudo (cara visible en internet)
+  shield-proxy:
+    build: ./shield-node
+    container_name: shield-proxy
+    ports:
+      - "8080:80"
+    networks:
+      red_internet:
+        ipv4_address: 172.28.0.10
+      red_tunel:
+        ipv4_address: 10.0.0.1
+    depends_on:
+      - office-server
+
+  # Contenedor 2: Servidor de la oficina (oculto, sin puertos abiertos al host)
+  office-server:
+    build: ./office-node
+    container_name: office-server
+    networks:
+      red_tunel:
+        ipv4_address: 10.0.0.2
+
+networks:
+  # Simula el internet publico
+  red_internet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+  # Simula el tunel privado WireGuard (10.0.0.0/24)
+  red_tunel:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.0.0.0/24
+          gateway: 10.0.0.254
