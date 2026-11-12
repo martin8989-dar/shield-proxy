@@ -1,6 +1,6 @@
 # Corporate Origin Shield & Reverse Proxy Tunnel
 
-Arquitectura de red y seguridad para publicar un servidor web local (en oficina o casa) a traves de un servidor externo (**Nodo Escudo**) conectado por un tunel privado cifrado con **WireGuard** y **Nginx** como Reverse Proxy, sin exponer la direccion IP real de origen ni abrir puertos entrantes en el router.
+Arquitectura de red y seguridad para publicar un servidor web local (en oficina o casa) a traves de un servidor externo (**Nodo Escudo**) conectado por un tunel privado con **WireGuard** y **Nginx** como Reverse Proxy, sin exponer la direccion IP real de origen ni abrir puertos en el router.
 
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED.svg)
 ![Nginx](https://img.shields.io/badge/Nginx-Reverse%20Proxy-009639.svg)
@@ -13,59 +13,94 @@ Arquitectura de red y seguridad para publicar un servidor web local (en oficina 
 
 ## Descripcion
 
-Cuando una empresa o desarrollador aloja un servidor fisico dentro de su propia oficina, publicarlo directamente a internet presenta dos riesgos importantes: cualquier persona puede descubrir la direccion IP publica real del lugar (quedando expuesto a ataques DDoS o escaneos directos) y obliga a abrir puertos en el router perimetral (Port Forwarding).
+Cuando se aloja un servidor fisico dentro de una oficina o casa, publicarlo directamente a internet tiene dos problemas grandes: cualquier persona puede ver la direccion IP publica real del lugar (quedando expuesto a ataques directos) y obliga a abrir puertos en el router (Port Forwarding).
 
-Este proyecto resuelve ese problema colocando un **Nodo Escudo** en un servidor externo que recibe todas las visitas publicas y las reenvia por un tunel privado (`10.0.0.0/24`) hacia el **Nodo Oficina**. El servidor de la oficina es quien inicia la conexion hacia afuera, logrando que desde internet parezca que el sistema vive en la IP del escudo y manteniendo la red local completamente oculta y cerrada.
+Este proyecto soluciona eso poniendo un **Nodo Escudo** adelante que recibe todas las visitas y las pasa por un tunel privado (`10.0.0.1` -> `10.0.0.2`) hacia el **Nodo Oficina**. Asi, de cara al publico, el servidor parece estar en otro lugar y la IP real de la oficina nunca se revela.
+
+> **Estado actual del proyecto y pruebas:**  
+> Para que el trafico salga con una IP publica de otro lugar en internet se requiere conectar el Nodo Escudo mediante una aplicacion de tunel externo o contratando un VPS de pago. Por ahora, el proyecto esta preparado y probado para funcionar en un solo PC usando **Docker Compose**, donde se simulan ambos servidores y la red privada del tunel (las capturas y pruebas de funcionamiento con Docker estan documentadas mas abajo).
+
+---
+
+## Diagrama de Arquitectura
+
+```mermaid
+flowchart LR
+    subgraph Z1["ZONA 1: INTERNET PUBLICO"]
+        direction TB
+        U["Usuario / Navegador Web<br/>Peticion HTTP / HTTPS"]
+    end
+
+    subgraph Z2["ZONA 2: BORDE EXTERNO (NODO ESCUDO)"]
+        direction TB
+        FW1["Firewall UFW<br/>Puertos: 80, 443, 51820/UDP"]
+        NGX["Nginx Reverse Proxy<br/>- Oculta cabeceras internas<br/>- Agrega X-Forwarded-For<br/>- Pantalla 503 si cae el tunel"]
+        WG1["Gateway Tunel (wg0)<br/>IP: 10.0.0.1"]
+        FW1 --> NGX --> WG1
+    end
+
+    subgraph Z3["ZONA 3: RED LOCAL PRIVADA (NODO OFICINA)"]
+        direction TB
+        NAT["Router Local / NAT<br/>0 Puertos Abiertos"]
+        WG2["Cliente Tunel (wg0)<br/>IP: 10.0.0.2 (Keepalive 25s)"]
+        FW2["Firewall Interno<br/>Puerto 8000 solo acepta 10.0.0.1"]
+        APP["Servidor de Oficina (Flask)<br/>Escuchando en 10.0.0.2:8000"]
+        NAT --> WG2 --> FW2 --> APP
+    end
+
+    U ==>|"1. Entra a IP del Escudo"| FW1
+    WG1 <==>|"2. Tunel Cifrado Privado<br/>(10.0.0.1 <-> 10.0.0.2)"| NAT
+
+    style Z1 fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Z2 fill:#111827,stroke:#f59e0b,stroke-width:2px,color:#f8fafc
+    style Z3 fill:#06281e,stroke:#10b981,stroke-width:2px,color:#f8fafc
+    style U fill:#1e293b,stroke:#38bdf8,color:#ffffff
+    style FW1 fill:#1f2937,stroke:#f59e0b,color:#ffffff
+    style NGX fill:#1f2937,stroke:#f59e0b,color:#ffffff
+    style WG1 fill:#1f2937,stroke:#f59e0b,color:#ffffff
+    style NAT fill:#064e3b,stroke:#10b981,color:#ffffff
+    style WG2 fill:#064e3b,stroke:#10b981,color:#ffffff
+    style FW2 fill:#064e3b,stroke:#10b981,color:#ffffff
+    style APP fill:#064e3b,stroke:#10b981,color:#ffffff
+```
+
+### Resumen del recorrido:
+1. **El visitante** entra a la direccion del Nodo Escudo pensando que ese es el servidor principal.
+2. **El Nodo Escudo (Nginx)** recibe la visita, oculta los datos tecnicos del servidor interno (`Server`, `X-Powered-By`) y le anota la IP del visitante en `X-Forwarded-For`.
+3. **El Tunel Privado** lleva el paquete desde `10.0.0.1` hasta `10.0.0.2` sin necesidad de abrir puertos en el router local.
+4. **El Nodo Oficina** revisa que el paquete venga unicamente desde `10.0.0.1` y muestra el panel web. Si el tunel se corta, el Nodo Escudo muestra una pantalla de error `503` propia.
 
 ---
 
 ## Caracteristicas Principales
 
-- **Ocultamiento de IP de Origen (Origin Shield)**: El dominio publico apunta unicamente al servidor externo. La direccion IP publica real de la oficina nunca aparece en registros DNS ni en las respuestas HTTP.
-- **Cero Puertos Abiertos en el Router Local**: El Nodo Oficina levanta el tunel WireGuard como cliente saliente con `PersistentKeepalive = 25`, atravesando el NAT o CGNAT del proveedor de internet sin requerir Port Forwarding.
-- **Aislamiento Estricto en Firewall (UFW)**: El servidor de la oficina bloquea cualquier conexion al puerto `8000` que no venga exactamente desde la IP interna del tunel (`10.0.0.1`).
-- **Limpieza de Cabeceras en el Borde**: Nginx desactiva `server_tokens` y oculta cabeceras internas como `Server` y `X-Powered-By` para no revelar que tecnologia corre detras.
-- **Trazabilidad de Visitantes Reales**: Aunque el trafico llega por el tunel, Nginx inyecta la IP real del visitante en `X-Forwarded-For` y `X-Real-IP` para que la oficina pueda auditar cada acceso.
-- **Pagina de Error 503 Personalizada**: Si el tunel con la oficina se corta o entra en mantenimiento, el Nodo Escudo responde con una pantalla `503` propia en menos de 3 segundos, evitando fugas de informacion.
-- **Entorno de Demostracion con Docker**: Incluye un laboratorio listo para levantar en un solo computador con dos redes virtuales separadas (una simulando internet y otra privada simulando el tunel).
+- **Ocultamiento de IP de Origen**: La direccion IP real de la oficina o del PC local nunca queda expuesta directamente a los visitantes.
+- **Sin Abrir Puertos en el Router**: El servidor local inicia la conexion saliente con `PersistentKeepalive = 25` para atravesar el NAT del router.
+- **Filtro Estricto en el Puerto 8000**: Tanto el firewall UFW como la aplicacion en Python solo aceptan paquetes que vengan desde `10.0.0.1`.
+- **Limpieza de Cabeceras**: Nginx oculta la version del servidor y elimina cabeceras internas antes de responder al navegador.
+- **Error 503 Personalizado**: Si se apaga el servidor de la oficina, Nginx muestra una pagina `503.html` de mantenimiento sin filtrar errores internos.
+- **Laboratorio Completo en Docker**: Configurado en `docker-compose.yml` para correr ambos nodos en un mismo PC sin gastar en servidores externos.
 
 ---
 
-## Diagrama de Arquitectura y Flujo de Trafico
-
-```mermaid
-flowchart LR
-    V[Visitante en Internet] -->|1. Peticion HTTP/HTTPS| S[Nodo Escudo - Servidor Externo<br/>Nginx + WireGuard 10.0.0.1]
-    S <-->|2. Tunel Cifrado UDP 51820<br/>PersistentKeepalive = 25s| R[Router de la Oficina<br/>0 Puertos Abiertos]
-    R <--> O[Nodo Oficina - Servidor Oculto<br/>App Python 10.0.0.2:8000]
-```
-
-### Paso a paso de como viaja una peticion:
-1. **Conexion saliente permanente**: El servidor de la oficina (`10.0.0.2`) se conecta al puerto `51820/UDP` del Nodo Escudo (`10.0.0.1`) y envia un pulso cada 25 segundos para que el router de la oficina mantenga abierto el canal de comunicacion sin abrir puertos de entrada.
-2. **Entrada por el Nodo Escudo**: Cuando un visitante entra a la web, se conecta a la IP publica del Nodo Escudo.
-3. **Filtrado y reenvio en Nginx**: Nginx recibe la peticion, guarda la IP del visitante en `X-Forwarded-For`, limpia las cabeceras del servidor interno y manda el paquete hacia `http://10.0.0.2:8000` por dentro del tunel.
-4. **Verificacion en la oficina**: El firewall local (UFW) y la aplicacion en Python comprueban que el paquete venga de `10.0.0.1` y muestran en pantalla los datos de auditoria.
-
----
-
-## Arquitectura de Modulos
+## Estructura de Archivos
 
 ```text
 shield-proxy/
-├── README.md                    # Documentacion general y guia de despliegue
-├── docker-compose.yml           # Laboratorio local con red publica y red de tunel
-├── shield-node/                 # Modulo 1: Servidor Publico Externo (Nodo Escudo)
-│   ├── Dockerfile               # Imagen de contenedor para el proxy Nginx
-│   ├── setup_shield.sh          # Script de instalacion de WireGuard, Nginx y UFW
-│   ├── nginx_shield.conf        # Configuracion de Reverse Proxy y limpieza de cabeceras
+├── README.md                    # Documentacion del proyecto y pruebas
+├── docker-compose.yml           # Simula los 2 servidores y el tunel en un solo PC
+├── shield-node/                 # Modulo 1: Nodo Escudo (Reverse Proxy)
+│   ├── Dockerfile               # Contenedor de Nginx
+│   ├── setup_shield.sh          # Script para instalar en un VPS Linux
+│   ├── nginx_shield.conf        # Reglas del Reverse Proxy y cabeceras
 │   └── errors/
-│       └── 503.html             # Pantalla 503 personalizada cuando el tunel se corta
-├── office-node/                 # Modulo 2: Servidor Oculto Local (Nodo Oficina)
-│   ├── Dockerfile               # Imagen de contenedor para el servidor interno
-│   ├── setup_office.sh          # Script de cliente WireGuard (Keepalive 25) y UFW
-│   ├── office_app.py            # Dashboard web en Flask para auditoria del tunel
-│   └── requirements.txt         # Dependencias de Python
-└── capturas/                    # Evidencias de funcionamiento del sistema
+│       └── 503.html             # Pagina de error cuando se corta el tunel
+├── office-node/                 # Modulo 2: Nodo Oficina (Servidor Oculto)
+│   ├── Dockerfile               # Contenedor de Python / Flask
+│   ├── setup_office.sh          # Script de WireGuard y firewall para oficina
+│   ├── office_app.py            # Panel web que muestra el estado del tunel
+│   └── requirements.txt         # Librerias de Python
+└── capturas/                    # Capturas de las pruebas hechas en Docker
     ├── panel-auditoria.png
     ├── docker-logs-tunel.png
     └── docker-contenedores.png
@@ -73,43 +108,37 @@ shield-proxy/
 
 ---
 
-## Evidencia y Pruebas del Sistema
+## Pruebas Realizadas con Docker
 
-### 1. Panel de Auditoria en el Nodo Oficina
+Como para sacar la IP en otra ubicacion real hay que usar una aplicacion de tunel externo o pagar un VPS en la nube, todas las pruebas funcionales del proyecto se hicieron en un PC local con **Docker Desktop**, levantando los dos contenedores conectados por la red interna `10.0.0.0/24`.
 
-Al entrar desde el navegador a traves del Nodo Escudo (`http://localhost:8080`), la aplicacion interna de la oficina muestra en tiempo real el estado de la conexion:
+### 1. Panel de Auditoria Recibiendo Trafico del Tunel
+
+Entrando a `http://localhost:8080` (el puerto del Nodo Escudo), el contenedor de la oficina responde mostrando que el tunel esta **Activo / Aislado**, que el paquete fue entregado por **`10.0.0.1`** y cuales fueron las cabeceras HTTP recibidas:
 
 ![Panel de Auditoria en el Navegador](capturas/panel-auditoria.png)
 
-**Detalle de lo que muestra el panel:**
-* **Estado del Tunel Seguro (`Activo / Aislado`)**: Confirma que la peticion llego por la red privada del tunel y no desde un acceso directo externo.
-* **IP Interna que Entrega el Paquete (`10.0.0.1`)**: Demuestra que quien le entrega los paquetes al servidor de la oficina es el Nodo Escudo.
-* **IP Publica del Visitante (`X-Forwarded-For`)**: Muestra la direccion IP de quien hizo la consulta original desde afuera, pasada por Nginx.
-* **Tabla de Cabeceras HTTP**: Permite revisar todas las cabeceras que llegaron hasta la oficina y comprobar que en ningun momento se expone la IP real del servidor local.
-
 ---
 
-### 2. Registro de Conexiones Internas en el Contenedor Oculto
+### 2. Logs del Servidor de Oficina (`office-server`)
 
-En los registros de consola del contenedor `office-server` se observa como el servidor escucha en su puerto interno `8000` (sin estar publicado hacia el computador host) y recibe todas las solicitudes exclusivamente desde la IP `10.0.0.1` del Nodo Escudo:
+En la consola de Docker se ve como el contenedor `office-server` corre en el puerto interno `8000` (aislado del exterior) y recibe las peticiones directamente desde `10.0.0.1`:
 
 ![Logs del Servidor de Oficina en Docker](capturas/docker-logs-tunel.png)
 
 ---
 
-### 3. Ejecucion de los Nodos en Docker Desktop
+### 3. Contenedores Activos en Docker Desktop
 
-Vista del entorno completo levantado con `docker compose`, donde conviven ambos contenedores conectados por la red privada del tunel con un consumo minimo de memoria y CPU:
+Vista de `shield-proxy` y `office-server` corriendo al mismo tiempo en el computador durante las pruebas:
 
 ![Contenedores en Docker Desktop](capturas/docker-contenedores.png)
 
 ---
 
-## Ejecucion de la Demostracion con Docker (En un solo computador)
+## Como Probarlo en tu PC con Docker
 
-Para levantar y probar todo el proyecto en tu propio equipo sin necesidad de contratar un VPS externo:
-
-### 1. Clonar el repositorio y levantar los contenedores
+### 1. Levantar los contenedores
 
 ```bash
 git clone https://github.com/martin8989-dar/shield-proxy.git
@@ -117,31 +146,31 @@ cd shield-proxy
 docker compose up --build -d
 ```
 
-### 2. Abrir el panel en el navegador
+### 2. Ver el panel en el navegador
 
-Entra en tu navegador a:
+Abrir en el navegador:
 
 ```text
 http://localhost:8080
 ```
 
-### 3. Simular un corte del tunel (Prueba de Error 503)
+### 3. Probar que pasa cuando se corta el tunel (Error 503)
 
-Para comprobar que el Nodo Escudo protege la informacion cuando la oficina pierde conexion, apaga el contenedor de la oficina:
+Apagar el contenedor de la oficina:
 
 ```bash
 docker stop office-server
 ```
 
-Al recargar `http://localhost:8080`, Nginx respondera con la pagina `503 - Servicio Temporalmente No Disponible` sin mostrar errores del sistema ni direcciones IP internas.
+Al recargar `http://localhost:8080`, aparece la pagina personalizada `503 - Servicio Temporalmente No Disponible`.
 
-Para volver a conectar el servidor de la oficina:
+Para volver a encenderlo:
 
 ```bash
 docker start office-server
 ```
 
-Para apagar el entorno completo:
+Para apagar todo:
 
 ```bash
 docker compose down
@@ -149,41 +178,14 @@ docker compose down
 
 ---
 
-## Despliegue en Servidores Reales (VPS + Oficina)
+## Como Usarlo con una IP Externa Real (Con VPS o App de Tunel)
 
-Si se desea montar en produccion utilizando un VPS con Ubuntu/Debian como **Nodo Escudo** y un computador en la oficina como **Nodo Oficina**:
+Si mas adelante se quiere publicar hacia internet con una IP distinta a la del PC local, hay dos formas de hacerlo:
 
-### 1. Configurar el Nodo Escudo (VPS Publico)
-
-Subir la carpeta `shield-node/` al VPS y ejecutar:
-
-```bash
-cd shield-node
-sudo bash setup_shield.sh
-```
-
-El script instalara WireGuard (`10.0.0.1/24`), configurara Nginx como Reverse Proxy, abrira en el firewall UFW solo los puertos `80`, `443` y `51820/UDP`, y mostrara en pantalla la **llave publica del escudo**.
-
-### 2. Configurar el Nodo Oficina (Servidor Local)
-
-Subir la carpeta `office-node/` al servidor de la oficina y ejecutar:
-
-```bash
-cd office-node
-sudo bash setup_office.sh
-```
-
-1. Copiar la **llave publica de la oficina** que entrega el script al finalizar.
-2. En la oficina, editar `/etc/wireguard/wg0.conf` para colocar la IP publica del VPS y la llave publica del Nodo Escudo.
-3. En el VPS, editar `/etc/wireguard/wg0.conf` para pegar la llave publica de la oficina.
-4. Activar el tunel en ambos equipos:
-   ```bash
-   sudo systemctl enable --now wg-quick@wg0
-   ```
-5. Iniciar la aplicacion web en el servidor de la oficina:
-   ```bash
-   python3 office_app.py
-   ```
+1. **Sin pagar (usando una aplicacion de tunel en el PC)**:  
+   Con los contenedores de Docker corriendo en el puerto `8080`, se puede usar una herramienta como *Cloudflare Tunnel* o *Pinggy* apuntando a `localhost:8080`. Eso genera un enlace publico con la IP externa de esa aplicacion sin mostrar la IP de tu casa.
+2. **Con un VPS externo (ejecutando los scripts Bash)**:  
+   Subiendo `shield-node/setup_shield.sh` al VPS publico y `office-node/setup_office.sh` al servidor de la oficina, cruzando las llaves de WireGuard en `/etc/wireguard/wg0.conf` y levantando el servicio con `sudo systemctl enable --now wg-quick@wg0`.
 
 ---
 
